@@ -11,6 +11,7 @@
 #include <stdio.h> // printf
 #include <stdlib.h> // exit
 #include <string.h> // memset
+#include "retrovk.h"
 
 // *******************************************************************
 // Public dynamic functions (implemented by the demo, all optional)
@@ -109,7 +110,7 @@ void RETRO_Initialize(void)
 	}
 
 	// Create window
-	SDL_WindowFlags flags = SDL_WINDOW_RESIZABLE;
+	SDL_WindowFlags flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_VULKAN;
 	if (RETRO.mode == RETRO_MODE_FULLWINDOW) {
 		flags |= SDL_WINDOW_BORDERLESS;
 	}
@@ -143,10 +144,15 @@ void RETRO_Initialize(void)
 
 	// Get actual size in pixels (handles High-DPI/Retina screens correctly)
 	SDL_GetWindowSizeInPixels(RETRO.window, &RETRO.width, &RETRO.height);
+
+	// Bring up the Vulkan backend (instance, device, swapchain, render pass, ...).
+	// Projection and per-frame state are owned by the demo / RETROVK from here on.
+	RETROVK_Initialize(RETRO.window, RETRO.vsync);
 }
 
 void RETRO_Deinitialize(void)
 {
+	RETROVK_Deinitialize();
 	SDL_DestroyWindow(RETRO.window);
 	SDL_Quit();
 }
@@ -244,7 +250,10 @@ void RETRO_Mainloop(void)
 
 		// Render the scene
 		unsigned long int start = SDL_GetTicks();
-		if (DEMO_Render) DEMO_Render(deltatime);
+		if (RETROVK_BeginFrame()) {
+			if (DEMO_Render) DEMO_Render(deltatime);
+			RETROVK_EndFrame();
+		}
 		unsigned long int stop = SDL_GetTicks();
 
 		// Limit FPS
