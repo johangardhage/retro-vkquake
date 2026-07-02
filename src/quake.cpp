@@ -69,7 +69,9 @@ bool UploadTextures(World *world)
 		miptex_t *mipTexture = world->map.getMipTexture(i);
 		if (!mipTexture || !mipTexture->name[0] || mipTexture->offsets[0] == 0) {
 			unsigned int filler = 0xFF000000;	// Opaque black
+			unsigned int transparent = 0x00000000;
 			RETROVK_UploadMeshTexture(&mesh, i, 1, 1, &filler);
+			RETROVK_UploadMeshLumaTexture(&mesh, i, 1, 1, &transparent);
 			continue;
 		}
 
@@ -78,15 +80,20 @@ bool UploadTextures(World *world)
 
 		// Expand the 8-bit indexed full-resolution mip into RGBA (force opaque alpha)
 		unsigned int *texture = new unsigned int[width * height];
+		unsigned int *lumaTexture = new unsigned int[width * height];
 		unsigned char *rawTexture = (unsigned char *)mipTexture + mipTexture->offsets[0];
 		for (int y = 0; y < height; y++) {
 			for (int x = 0; x < width; x++) {
-				texture[x + y * width] = world->map.palette[rawTexture[x + y * width]] | 0xFF000000;
+				unsigned char colorIndex = rawTexture[x + y * width];
+				texture[x + y * width] = world->map.palette[colorIndex] | 0xFF000000;
+				lumaTexture[x + y * width] = (colorIndex >= 224) ? (world->map.palette[colorIndex] | 0xFF000000) : 0x00000000;
 			}
 		}
 
 		RETROVK_UploadMeshTexture(&mesh, i, width, height, texture);
+		RETROVK_UploadMeshLumaTexture(&mesh, i, width, height, lumaTexture);
 		delete[] texture;
+		delete[] lumaTexture;
 	}
 
 	return true;
@@ -463,12 +470,6 @@ void DEMO_Initialize(void)
 		RETRO_RageQuit("Unable to build vertex buffer\n");
 	}
 
-	// The textured pipeline still uses the luma descriptor set. Provide dummy
-	// descriptors until fullbright luma is added in a later commit.
-	unsigned int filler = 0xFFFFFFFF;
-	for (int i = 0; i < world.map.getNumTextures(); i++) {
-		RETROVK_UploadMeshLumaTexture(&mesh, i, 1, 1, &filler);
-	}
 	RETROVK_CreateMeshPipelines(&mesh, quake_vert_spv, sizeof(quake_vert_spv), quake_frag_spv, sizeof(quake_frag_spv));
 
 	// Set the camera's starting position
