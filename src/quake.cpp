@@ -27,6 +27,7 @@ struct World
 	RETRO_BSP map;							// The loaded map (BSP, palette and colormap), owned by value
 
 	primdesc_t *surfacePrimitives = NULL;	// Array of surface primitives, contains vertex information for every surface
+	int *visibleSurfaces = NULL;			// Array of visible surfaces, contains an index to the surfaces
 	int numMaxEdgesPerSurface = 0;			// Max edges per surface
 	SurfaceDraw *surfaceDraws = NULL;		// Per-surface slice into the mesh vertex buffer
 };
@@ -40,6 +41,9 @@ RETRO_Camera camera;
 //
 bool BuildSurfacePrimitives(World *world)
 {
+	// Allocate memory for the visible surfaces array
+	world->visibleSurfaces = new int [world->map.getNumSurfaceLists()];
+
 	// Calculate max number of edges per surface
 	world->numMaxEdgesPerSurface = 0;
 	for (int i = 0; i < world->map.getNumSurfaces(); i++) {
@@ -140,16 +144,107 @@ void GetSurfaceColor(int surface, float color[3])
 }
 
 //
-// Draw all BSP surfaces.
+// Draw the visible surfaces.
 //
-void DrawSurfaces(World *world)
+void DrawSurfaces(World *world, int *visibleSurfaces, int numVisibleSurfaces)
 {
-	for (int surface = 0; surface < world->map.getNumSurfaces(); surface++) {
+	for (int i = 0; i < numVisibleSurfaces; i++) {
+		int surface = visibleSurfaces[i];
 		const SurfaceDraw *draw = &world->surfaceDraws[surface];
 		float color[3];
 		GetSurfaceColor(surface, color);
-		RETROVK_DrawMeshRange(&mesh, 0, draw->firstVertex, draw->vertexCount, color);
+		RETROVK_DrawMeshRange(&mesh, 0, 0, draw->firstVertex, draw->vertexCount, color, 0);
 	}
+}
+
+//
+// Calculate which other leaves are visible from the specified leaf, fetch the associated surfaces and draw them.
+//
+void DrawVisibleSet(World *world, dleaf_t *pLeaf)
+{
+	int numVisibleSurfaces = 0;
+	// Leaves are numbered 1..numLeaves; bit (i-1) of the PVS maps to leaf i.
+	int numLeaves = world->map.getNumLeaves();
+
+	if (pLeaf->visofs < 0) {
+		// No visibility information for this leaf: treat every leaf as potentially visible.
+		for (int i = 1; i <= numLeaves; i++) {
+			dleaf_t *visibleLeaf = world->map.getLeaf(i);
+			int firstSurface = visibleLeaf->firstmarksurface;
+			int lastSurface = firstSurface + visibleLeaf->nummarksurfaces;
+			for (int k = firstSurface; k < lastSurface; k++) {
+				if (numVisibleSurfaces < world->map.getNumSurfaceLists()) {
+					world->visibleSurfaces[numVisibleSurfaces++] = world->map.getSurfaceList(k);
+				}
+			}
+		}
+	} else {
+		// Decompress the run-length encoded PVS. A zero byte means "skip the next
+		// (8 * following byte) leaves"; any other byte holds 8 visibility bits,
+		// least-significant bit first.
+		unsigned char *visibilityList = world->map.getVisibilityList(pLeaf->visofs);
+		for (int i = 1; i <= numLeaves; ) {
+			if (*visibilityList == 0) {
+				i += 8 * visibilityList[1];
+				visibilityList += 2;
+			} else {
+				for (int bit = 1; bit < 256 && i <= numLeaves; bit <<= 1, i++) {
+					if (*visibilityList & bit) {
+						// Fetch the leaf that is seen and copy its surfaces
+						dleaf_t *visibleLeaf = world->map.getLeaf(i);
+						int firstSurface = visibleLeaf->firstmarksurface;
+						int lastSurface = firstSurface + visibleLeaf->nummarksurfaces;
+						for (int k = firstSurface; k < lastSurface; k++) {
+							if (numVisibleSurfaces < world->map.getNumSurfaceLists()) {
+								world->visibleSurfaces[numVisibleSurfaces++] = world->map.getSurfaceList(k);
+							}
+						}
+					}
+				}
+				visibilityList++;
+			}
+		}
+	}
+
+	// Draw the copied surfaces
+	DrawSurfaces(world, world->visibleSurfaces, numVisibleSurfaces);
+}
+
+//
+// Traverse the BSP tree to find the leaf containing the camera.
+//
+dleaf_t *FindCameraLeaf(World *world, RETRO_Camera *camera)
+{
+	dleaf_t *leaf = NULL;
+
+	// Fetch the start node
+	dnode_t *node = world->map.getStartNode();
+
+	while (!leaf) {
+		short nextNodeId;
+
+		// Get a pointer to the plane which intersects the node
+		dplane_t *plane = world->map.getPlane(node->planenum);
+
+		// Calculate distance to the intersecting plane
+		float distance = DotProduct(plane->normal, camera->origin);
+
+		// If the camera is in front of the plane, traverse the right (front) node, otherwise traverse the left (back) node
+		if (distance > plane->dist) {
+			nextNodeId = node->children[0];
+		} else {
+			nextNodeId = node->children[1];
+		}
+
+		// If next node >= 0, traverse the node, otherwise use the inverse of the node as the index to the leaf (and we are done!)
+		if (nextNodeId >= 0) {
+			node = world->map.getNode(nextNodeId);
+		} else {
+			leaf = world->map.getLeaf(~nextNodeId);
+		}
+	}
+
+	return leaf;
 }
 
 void DEMO_Startup(void)
@@ -178,10 +273,13 @@ void DEMO_Initialize(void)
 	}
 
 	// The solid pipeline still uses the mesh descriptor layout, so provide one
-	// dummy texture slot until real BSP textures are added.
+	// dummy descriptor in each mesh texture set until real BSP textures are added.
 	unsigned int filler = 0xFFFFFFFF;
 	RETROVK_CreateMeshTextures(&mesh, 1, VK_FILTER_NEAREST, VK_FILTER_NEAREST);
 	RETROVK_UploadMeshTexture(&mesh, 0, 1, 1, &filler);
+	RETROVK_UploadMeshLumaTexture(&mesh, 0, 1, 1, &filler);
+	RETROVK_CreateMeshLightmaps(&mesh, 1, VK_FILTER_NEAREST, VK_FILTER_NEAREST);
+	RETROVK_UploadMeshLightmap(&mesh, 0, 1, 1, &filler);
 	RETROVK_CreateMeshPipelines(&mesh, quake_vert_spv, sizeof(quake_vert_spv), quake_frag_spv, sizeof(quake_frag_spv));
 
 	// Set the camera's starting position
@@ -198,6 +296,7 @@ void DEMO_Deinitialize(void)
 
 	if (world.surfaceDraws) delete[] world.surfaceDraws;
 	if (world.surfacePrimitives) delete[] world.surfacePrimitives;
+	if (world.visibleSurfaces) delete[] world.visibleSurfaces;
 	RETRO_FreeBSP(&world.map);
 }
 
@@ -267,8 +366,10 @@ void DEMO_Render(double deltatime)
 	Mat4LookAt(camera.origin, center, camera.up, view);
 	Mat4Multiply(projection, view, mvp);
 
-	// Render every BSP surface in solid colour. Visibility culling and texture
-	// mapping are added in later commits.
-	RETROVK_PrepareMeshDraws(&mesh, mvp, RETROVK_RENDER_SOLID);
-	DrawSurfaces(&world);
+	// Find the leaf the camera is in, then draw everything visible from it.
+	dleaf_t *leaf = FindCameraLeaf(&world, &camera);
+
+	// Render visible BSP surfaces in solid colour. Texture mapping is added in a later commit.
+	RETROVK_PrepareMeshDraws(&mesh, mvp, RETROVK_RENDER_SOLID, 0.0f, camera.origin);
+	DrawVisibleSet(&world, leaf);
 }
