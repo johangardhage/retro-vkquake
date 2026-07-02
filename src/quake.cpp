@@ -33,8 +33,50 @@ struct World
 };
 
 World world;
-RETROVK_Mesh mesh;				// Solid mesh resources, owned and driven through retrovk.h
+RETROVK_Mesh mesh;				// Textured mesh resources, owned and driven through retrovk.h
+RETROVK_RenderMode renderMode = RETROVK_RENDER_TEXTURED;	// Selected with keys 1-4
 RETRO_Camera camera;
+
+//
+// Expand the palettised mip textures into RGBA images and upload them to the
+// mesh, one slot per BSP texture.
+//
+bool UploadTextures(World *world)
+{
+	int numTextures = world->map.getNumTextures();
+
+	// NEAREST magnification (chunky texels, matching the old GL_NEAREST) and
+	// trilinear minification across mip levels.
+	RETROVK_CreateMeshTextures(&mesh, numTextures, VK_FILTER_NEAREST, VK_FILTER_LINEAR);
+
+	// Build an RGBA image for every texture slot. Missing slots get a 1x1 filler
+	// so that every surface has a valid texture to bind.
+	for (int i = 0; i < numTextures; i++) {
+		miptex_t *mipTexture = world->map.getMipTexture(i);
+		if (!mipTexture || !mipTexture->name[0] || mipTexture->offsets[0] == 0) {
+			unsigned int filler = 0xFF000000;	// Opaque black
+			RETROVK_UploadMeshTexture(&mesh, i, 1, 1, &filler);
+			continue;
+		}
+
+		int width = mipTexture->width;
+		int height = mipTexture->height;
+
+		// Expand the 8-bit indexed full-resolution mip into RGBA (force opaque alpha)
+		unsigned int *texture = new unsigned int[width * height];
+		unsigned char *rawTexture = (unsigned char *)mipTexture + mipTexture->offsets[0];
+		for (int y = 0; y < height; y++) {
+			for (int x = 0; x < width; x++) {
+				texture[x + y * width] = world->map.palette[rawTexture[x + y * width]] | 0xFF000000;
+			}
+		}
+
+		RETROVK_UploadMeshTexture(&mesh, i, width, height, texture);
+		delete[] texture;
+	}
+
+	return true;
+}
 
 //
 // Build per-surface primitive vertices
@@ -55,9 +97,17 @@ bool BuildSurfacePrimitives(World *world)
 	// Allocate memory for the surface primitive array
 	world->surfacePrimitives = new primdesc_t [world->map.getNumSurfaces() * world->numMaxEdgesPerSurface];
 
-	// Loop through all the surfaces to fetch the vertices
+	// Loop through all the surfaces to fetch the vertices and calculate their texture coords
 	for (int i = 0; i < world->map.getNumSurfaces(); i++) {
 		int numEdges = world->map.getNumEdges(i);
+
+		// Get a pointer to texinfo for this surface
+		texinfo_t *textureInfo = world->map.getTextureInfo(i);
+		// Get a pointer to the surface's miptextures (missing texture slots return NULL)
+		miptex_t *mipTexture = world->map.getMipTexture(textureInfo->miptex);
+		// Fall back to a unit size when the texture slot has no data (missing texture)
+		float texWidth = (mipTexture && mipTexture->width) ? (float)mipTexture->width : 1.0f;
+		float texHeight = (mipTexture && mipTexture->height) ? (float)mipTexture->height : 1.0f;
 
 		// Point to a surface primitive array
 		primdesc_t *primitives = &world->surfacePrimitives[i * world->numMaxEdgesPerSurface];
@@ -74,6 +124,10 @@ bool BuildSurfacePrimitives(World *world)
 			primitives->v[0] = ((float *)vertex)[0];
 			primitives->v[1] = ((float *)vertex)[1];
 			primitives->v[2] = ((float *)vertex)[2];
+
+			// Calculate the vertex's texture coords and store it in the primitive array
+			primitives->t[0] = (DotProduct(textureInfo->vecs[0], primitives->v) + textureInfo->vecs[0][3]) / texWidth;
+			primitives->t[1] = (DotProduct(textureInfo->vecs[1], primitives->v) + textureInfo->vecs[1][3]) / texHeight;
 		}
 	}
 
@@ -117,8 +171,8 @@ bool BuildMeshVertices(World *world)
 				vertices[written].pos[0] = p->v[0];
 				vertices[written].pos[1] = p->v[1];
 				vertices[written].pos[2] = p->v[2];
-				vertices[written].uv[0] = 0.0f;
-				vertices[written].uv[1] = 0.0f;
+				vertices[written].uv[0] = p->t[0];
+				vertices[written].uv[1] = p->t[1];
 				written++;
 			}
 		}
@@ -150,10 +204,12 @@ void DrawSurfaces(World *world, int *visibleSurfaces, int numVisibleSurfaces)
 {
 	for (int i = 0; i < numVisibleSurfaces; i++) {
 		int surface = visibleSurfaces[i];
+		// The texture this surface uses, and where its triangles live in the mesh
+		texinfo_t *textureInfo = world->map.getTextureInfo(surface);
 		const SurfaceDraw *draw = &world->surfaceDraws[surface];
 		float color[3];
 		GetSurfaceColor(surface, color);
-		RETROVK_DrawMeshRange(&mesh, 0, 0, draw->firstVertex, draw->vertexCount, color, 0);
+		RETROVK_DrawMeshRange(&mesh, textureInfo->miptex, 0, draw->firstVertex, draw->vertexCount, color, 0);
 	}
 }
 
@@ -265,6 +321,9 @@ void DEMO_Initialize(void)
 	}
 
 	// Build the world from the map
+	if (!UploadTextures(&world)) {
+		RETRO_RageQuit("Unable to initialize world textures\n");
+	}
 	if (!BuildSurfacePrimitives(&world)) {
 		RETRO_RageQuit("Unable to initialize world surfaces\n");
 	}
@@ -272,12 +331,12 @@ void DEMO_Initialize(void)
 		RETRO_RageQuit("Unable to build vertex buffer\n");
 	}
 
-	// The solid pipeline still uses the mesh descriptor layout, so provide one
-	// dummy descriptor in each mesh texture set until real BSP textures are added.
+	// The textured pipeline still uses lightmap and luma descriptor sets. Provide
+	// dummy descriptors until those features are added in later commits.
 	unsigned int filler = 0xFFFFFFFF;
-	RETROVK_CreateMeshTextures(&mesh, 1, VK_FILTER_NEAREST, VK_FILTER_NEAREST);
-	RETROVK_UploadMeshTexture(&mesh, 0, 1, 1, &filler);
-	RETROVK_UploadMeshLumaTexture(&mesh, 0, 1, 1, &filler);
+	for (int i = 0; i < world.map.getNumTextures(); i++) {
+		RETROVK_UploadMeshLumaTexture(&mesh, i, 1, 1, &filler);
+	}
 	RETROVK_CreateMeshLightmaps(&mesh, 1, VK_FILTER_NEAREST, VK_FILTER_NEAREST);
 	RETROVK_UploadMeshLightmap(&mesh, 0, 1, 1, &filler);
 	RETROVK_CreateMeshPipelines(&mesh, quake_vert_spv, sizeof(quake_vert_spv), quake_frag_spv, sizeof(quake_frag_spv));
@@ -302,6 +361,17 @@ void DEMO_Deinitialize(void)
 
 void DEMO_Input(double deltatime)
 {
+	// Select the render mode with keys 1-4.
+	if (RETRO_KeyPressed(SDL_SCANCODE_1)) {
+		renderMode = RETROVK_RENDER_TEXTURED;
+	} else if (RETRO_KeyPressed(SDL_SCANCODE_2)) {
+		renderMode = RETROVK_RENDER_SOLID;
+	} else if (RETRO_KeyPressed(SDL_SCANCODE_3)) {
+		renderMode = RETROVK_RENDER_WIREFRAME;
+	} else if (RETRO_KeyPressed(SDL_SCANCODE_4)) {
+		renderMode = RETROVK_RENDER_POINTS;
+	}
+
 	// Keyboard handling
 	float scale = (float)(deltatime * RETRO_INPUT_FRAMERATE);
 
@@ -369,7 +439,7 @@ void DEMO_Render(double deltatime)
 	// Find the leaf the camera is in, then draw everything visible from it.
 	dleaf_t *leaf = FindCameraLeaf(&world, &camera);
 
-	// Render visible BSP surfaces in solid colour. Texture mapping is added in a later commit.
-	RETROVK_PrepareMeshDraws(&mesh, mvp, RETROVK_RENDER_SOLID, 0.0f, camera.origin);
+	// Render visible BSP surfaces.
+	RETROVK_PrepareMeshDraws(&mesh, mvp, renderMode, 0.0f, camera.origin);
 	DrawVisibleSet(&world, leaf);
 }
