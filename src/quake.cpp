@@ -9,16 +9,148 @@
 #include "lib/retrobsp.h"
 #include "lib/retromath.h"
 #include "lib/retrocamera.h"
+#include "quake_vert_spv.h"
+#include "quake_frag_spv.h"
 
 #define MOVEMENT_SPEED 5.0
+
+// Where a surface's triangles live in the mesh vertex buffer. One entry
+// per BSP surface.
+struct SurfaceDraw
+{
+	int firstVertex;
+	int vertexCount;
+};
 
 struct World
 {
 	RETRO_BSP map;							// The loaded map (BSP, palette and colormap), owned by value
+
+	primdesc_t *surfacePrimitives = NULL;	// Array of surface primitives, contains vertex information for every surface
+	int numMaxEdgesPerSurface = 0;			// Max edges per surface
+	SurfaceDraw *surfaceDraws = NULL;		// Per-surface slice into the mesh vertex buffer
 };
 
 World world;
+RETROVK_Mesh mesh;				// Solid mesh resources, owned and driven through retrovk.h
 RETRO_Camera camera;
+
+//
+// Build per-surface primitive vertices
+//
+bool BuildSurfacePrimitives(World *world)
+{
+	// Calculate max number of edges per surface
+	world->numMaxEdgesPerSurface = 0;
+	for (int i = 0; i < world->map.getNumSurfaces(); i++) {
+		if (world->numMaxEdgesPerSurface < world->map.getNumEdges(i)) {
+			world->numMaxEdgesPerSurface = world->map.getNumEdges(i);
+		}
+	}
+
+	// Allocate memory for the surface primitive array
+	world->surfacePrimitives = new primdesc_t [world->map.getNumSurfaces() * world->numMaxEdgesPerSurface];
+
+	// Loop through all the surfaces to fetch the vertices
+	for (int i = 0; i < world->map.getNumSurfaces(); i++) {
+		int numEdges = world->map.getNumEdges(i);
+
+		// Point to a surface primitive array
+		primdesc_t *primitives = &world->surfacePrimitives[i * world->numMaxEdgesPerSurface];
+
+		for (int j = 0; j < numEdges; j++, primitives++) {
+			// Get an edge id from the surface. Fetch the correct edge by using the id in the Edge List.
+			// The winding is backwards!
+			int edgeId = world->map.getEdgeList(world->map.getSurface(i)->firstedge + (numEdges - 1 - j));
+			// Positive surfedge -> edge used forwards (start vertex); otherwise reversed (end vertex)
+			int vertexId = ((edgeId >= 0) ? world->map.getEdge(edgeId)->v[0] : world->map.getEdge(-edgeId)->v[1]);
+
+			// Store the vertex in the primitive array
+			vec3_t *vertex = world->map.getVertex(vertexId);
+			primitives->v[0] = ((float *)vertex)[0];
+			primitives->v[1] = ((float *)vertex)[1];
+			primitives->v[2] = ((float *)vertex)[2];
+		}
+	}
+
+	return true;
+}
+
+//
+// Triangulate every surface (BSP faces are convex fans) into one device-local
+// vertex buffer, recording each surface's slice so it can be drawn on its own.
+//
+bool BuildMeshVertices(World *world)
+{
+	int numSurfaces = world->map.getNumSurfaces();
+	world->surfaceDraws = new SurfaceDraw[numSurfaces];
+
+	// Count the triangulated vertices: an N-edge fan yields (N-2) triangles
+	int totalVertices = 0;
+	for (int i = 0; i < numSurfaces; i++) {
+		int numEdges = world->map.getNumEdges(i);
+		if (numEdges >= 3) {
+			totalVertices += (numEdges - 2) * 3;
+		}
+	}
+
+	RETROVK_Vertex *vertices = new RETROVK_Vertex[totalVertices];
+	int written = 0;
+
+	for (int i = 0; i < numSurfaces; i++) {
+		int numEdges = world->map.getNumEdges(i);
+		primdesc_t *prims = &world->surfacePrimitives[i * world->numMaxEdgesPerSurface];
+
+		world->surfaceDraws[i].firstVertex = written;
+		world->surfaceDraws[i].vertexCount = (numEdges >= 3) ? (numEdges - 2) * 3 : 0;
+
+		// Fan triangulation around vertex 0: (0, k, k+1), preserving the winding
+		// the primitive array was built with.
+		for (int k = 1; k + 1 < numEdges; k++) {
+			const int idx[3] = { 0, k, k + 1 };
+			for (int t = 0; t < 3; t++) {
+				primdesc_t *p = &prims[idx[t]];
+				vertices[written].pos[0] = p->v[0];
+				vertices[written].pos[1] = p->v[1];
+				vertices[written].pos[2] = p->v[2];
+				vertices[written].uv[0] = 0.0f;
+				vertices[written].uv[1] = 0.0f;
+				written++;
+			}
+		}
+	}
+
+	// Hand the vertices to the mesh (uploaded to a device-local buffer internally)
+	RETROVK_UploadMeshVertices(&mesh, vertices, totalVertices);
+	delete[] vertices;
+
+	return true;
+}
+
+//
+// A flat colour for a surface in solid render mode: a deterministic colour
+// derived from the surface id.
+//
+void GetSurfaceColor(int surface, float color[3])
+{
+	unsigned int hash = (unsigned int)surface * 1103515245u + 12345u;
+	color[0] = (hash & 0xff) / 255.0f;
+	color[1] = ((hash >> 8) & 0xff) / 255.0f;
+	color[2] = ((hash >> 16) & 0xff) / 255.0f;
+}
+
+//
+// Draw all BSP surfaces.
+//
+void DrawSurfaces(World *world)
+{
+	for (int surface = 0; surface < world->map.getNumSurfaces(); surface++) {
+		const SurfaceDraw *draw = &world->surfaceDraws[surface];
+		float color[3];
+		GetSurfaceColor(surface, color);
+		RETROVK_DrawMeshRange(&mesh, 0, draw->firstVertex, draw->vertexCount, color);
+	}
+}
 
 void DEMO_Startup(void)
 {
@@ -37,6 +169,21 @@ void DEMO_Initialize(void)
 		RETRO_RageQuit("Unable to load BSP\n");
 	}
 
+	// Build the world from the map
+	if (!BuildSurfacePrimitives(&world)) {
+		RETRO_RageQuit("Unable to initialize world surfaces\n");
+	}
+	if (!BuildMeshVertices(&world)) {
+		RETRO_RageQuit("Unable to build vertex buffer\n");
+	}
+
+	// The solid pipeline still uses the mesh descriptor layout, so provide one
+	// dummy texture slot until real BSP textures are added.
+	unsigned int filler = 0xFFFFFFFF;
+	RETROVK_CreateMeshTextures(&mesh, 1, VK_FILTER_NEAREST, VK_FILTER_NEAREST);
+	RETROVK_UploadMeshTexture(&mesh, 0, 1, 1, &filler);
+	RETROVK_CreateMeshPipelines(&mesh, quake_vert_spv, sizeof(quake_vert_spv), quake_frag_spv, sizeof(quake_frag_spv));
+
 	// Set the camera's starting position
 	camera.SetPosition(540.0f, 260.0f, 100.0f);
 	camera.SetOrientation(90.0f, 0.0f);
@@ -46,6 +193,11 @@ void DEMO_Initialize(void)
 
 void DEMO_Deinitialize(void)
 {
+	// Destroy every GPU resource (waits for the device to go idle first)
+	RETROVK_DestroyMesh(&mesh);
+
+	if (world.surfaceDraws) delete[] world.surfaceDraws;
+	if (world.surfacePrimitives) delete[] world.surfacePrimitives;
 	RETRO_FreeBSP(&world.map);
 }
 
@@ -103,8 +255,7 @@ void DEMO_Render(double deltatime)
 {
 	(void)deltatime;
 
-	// Build the model-view-projection matrix (Vulkan equivalent of
-	// gluPerspective/gluLookAt). Surface rendering is added in the next commit.
+	// Build the model-view-projection matrix (Vulkan equivalent of gluPerspective/gluLookAt)
 	float aspect = (float)RETROVK.swapchainExtent.width / (float)RETROVK.swapchainExtent.height;
 	mat4_t projection, view, mvp;
 	Mat4Perspective((float)RETRO.fov, aspect, (float)RETRO.znear, (float)RETRO.zfar, projection);
@@ -115,5 +266,9 @@ void DEMO_Render(double deltatime)
 	};
 	Mat4LookAt(camera.origin, center, camera.up, view);
 	Mat4Multiply(projection, view, mvp);
-	(void)mvp;
+
+	// Render every BSP surface in solid colour. Visibility culling and texture
+	// mapping are added in later commits.
+	RETROVK_PrepareMeshDraws(&mesh, mvp, RETROVK_RENDER_SOLID);
+	DrawSurfaces(&world);
 }
