@@ -1,8 +1,10 @@
 #version 450
 
 layout(location = 0) in vec2 fragTexCoord;
+layout(location = 1) in vec2 fragLightCoord;
 
 layout(set = 0, binding = 0) uniform sampler2D texSampler;
+layout(set = 1, binding = 0) uniform sampler2D lightSampler;
 
 layout(push_constant) uniform PushConstants {
 	mat4 mvp;
@@ -16,7 +18,9 @@ void main()
 {
 	if (pc.mode == 0) {
 		// Textured
-		outColor = texture(texSampler, fragTexCoord);
+		vec4 base = texture(texSampler, fragTexCoord);
+		float light = texture(lightSampler, fragLightCoord).r;
+		outColor = vec4(base.rgb * light * 2.0, base.a);
 	} else if (pc.mode == 1) {
 		// Solid: the surface's flat colour, no shading
 		outColor = vec4(pc.color, 1.0);

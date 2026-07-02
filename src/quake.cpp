@@ -11,6 +11,7 @@
 #include "lib/retrocamera.h"
 #include "quake_vert_spv.h"
 #include "quake_frag_spv.h"
+#include <float.h>
 
 #define MOVEMENT_SPEED 5.0
 
@@ -22,6 +23,16 @@ struct SurfaceDraw
 	int vertexCount;
 };
 
+struct LightmapRect
+{
+	int x;
+	int y;
+	int width;
+	int height;
+	int minS;
+	int minT;
+};
+
 struct World
 {
 	RETRO_BSP map;							// The loaded map (BSP, palette and colormap), owned by value
@@ -30,6 +41,9 @@ struct World
 	int *visibleSurfaces = NULL;			// Array of visible surfaces, contains an index to the surfaces
 	int numMaxEdgesPerSurface = 0;			// Max edges per surface
 	SurfaceDraw *surfaceDraws = NULL;		// Per-surface slice into the mesh vertex buffer
+	LightmapRect *lightmaps = NULL;			// Per-surface rectangle inside the lightmap atlas
+	int lightmapAtlasWidth = 0;
+	int lightmapAtlasHeight = 0;
 };
 
 World world;
@@ -79,26 +93,71 @@ bool UploadTextures(World *world)
 }
 
 //
+// Fill the atlas rectangle for one surface. Sky and liquid surfaces
+// (TEX_SPECIAL), and faces with no stored lighting, get solid white luxels so
+// the modulate pass leaves the base texture at full brightness.
+//
+void BuildLightmap(World *world, int surface, unsigned int *atlas)
+{
+	LightmapRect *rect = &world->lightmaps[surface];
+	dface_t *face = world->map.getSurface(surface);
+	texinfo_t *textureInfo = world->map.getTextureInfo(surface);
+	unsigned char *samples = world->map.getLightmap(face->lightofs);
+
+	if ((textureInfo->flags & TEX_SPECIAL) || !samples) {
+		for (int y = 0; y < rect->height; y++) {
+			for (int x = 0; x < rect->width; x++) {
+				atlas[(rect->x + x) + (rect->y + y) * world->lightmapAtlasWidth] = 0xFFFFFFFF;
+			}
+		}
+		return;
+	}
+
+	// Combine every light style affecting this surface into one grayscale map.
+	// Each active style contributes one width*height block of samples.
+	int size = rect->width * rect->height;
+	for (int y = 0; y < rect->height; y++) {
+		for (int x = 0; x < rect->width; x++) {
+			int src = x + y * rect->width;
+			int intensity = 0;
+			for (int style = 0; style < MAXLIGHTMAPS && face->styles[style] != 255; style++) {
+				intensity += samples[style * size + src];
+			}
+			unsigned int light = (intensity > 255) ? 255 : (unsigned int)intensity;
+			atlas[(rect->x + x) + (rect->y + y) * world->lightmapAtlasWidth] = 0xFF000000 | (light << 16) | (light << 8) | light;
+		}
+	}
+}
+
+//
 // Build per-surface primitive vertices
 //
 bool BuildSurfacePrimitives(World *world)
 {
+	int numSurfaces = world->map.getNumSurfaces();
+
 	// Allocate memory for the visible surfaces array
 	world->visibleSurfaces = new int [world->map.getNumSurfaceLists()];
 
 	// Calculate max number of edges per surface
 	world->numMaxEdgesPerSurface = 0;
-	for (int i = 0; i < world->map.getNumSurfaces(); i++) {
+	for (int i = 0; i < numSurfaces; i++) {
 		if (world->numMaxEdgesPerSurface < world->map.getNumEdges(i)) {
 			world->numMaxEdgesPerSurface = world->map.getNumEdges(i);
 		}
 	}
 
 	// Allocate memory for the surface primitive array
-	world->surfacePrimitives = new primdesc_t [world->map.getNumSurfaces() * world->numMaxEdgesPerSurface];
+	world->surfacePrimitives = new primdesc_t [numSurfaces * world->numMaxEdgesPerSurface];
+	world->lightmaps = new LightmapRect [numSurfaces];
+	world->lightmapAtlasWidth = 1024;
 
-	// Loop through all the surfaces to fetch the vertices and calculate their texture coords
-	for (int i = 0; i < world->map.getNumSurfaces(); i++) {
+	int atlasX = 0;
+	int atlasY = 0;
+	int atlasRowHeight = 0;
+
+	// Loop through all the surfaces to fetch the vertices and calculate their texture and lightmap coords
+	for (int i = 0; i < numSurfaces; i++) {
 		int numEdges = world->map.getNumEdges(i);
 
 		// Get a pointer to texinfo for this surface
@@ -111,6 +170,9 @@ bool BuildSurfacePrimitives(World *world)
 
 		// Point to a surface primitive array
 		primdesc_t *primitives = &world->surfacePrimitives[i * world->numMaxEdgesPerSurface];
+
+		// Track the surface's texture-space bounds to size its lightmap
+		float minS = FLT_MAX, minT = FLT_MAX, maxS = -FLT_MAX, maxT = -FLT_MAX;
 
 		for (int j = 0; j < numEdges; j++, primitives++) {
 			// Get an edge id from the surface. Fetch the correct edge by using the id in the Edge List.
@@ -125,9 +187,76 @@ bool BuildSurfacePrimitives(World *world)
 			primitives->v[1] = ((float *)vertex)[1];
 			primitives->v[2] = ((float *)vertex)[2];
 
-			// Calculate the vertex's texture coords and store it in the primitive array
-			primitives->t[0] = (DotProduct(textureInfo->vecs[0], primitives->v) + textureInfo->vecs[0][3]) / texWidth;
-			primitives->t[1] = (DotProduct(textureInfo->vecs[1], primitives->v) + textureInfo->vecs[1][3]) / texHeight;
+			// Project the vertex into texture space
+			float s = DotProduct(textureInfo->vecs[0], primitives->v) + textureInfo->vecs[0][3];
+			float t = DotProduct(textureInfo->vecs[1], primitives->v) + textureInfo->vecs[1][3];
+
+			// Store normalized texture coords, and stash raw texture-space coords
+			// in the lightmap slot until the bounds are known.
+			primitives->t[0] = s / texWidth;
+			primitives->t[1] = t / texHeight;
+			primitives->l[0] = s;
+			primitives->l[1] = t;
+
+			if (s < minS) minS = s;
+			if (t < minT) minT = t;
+			if (s > maxS) maxS = s;
+			if (t > maxT) maxT = t;
+		}
+
+		// Size the lightmap from the texture-space bounds (one luxel per 16 texels)
+		int lightMinS = FloorDiv16(minS);
+		int lightMinT = FloorDiv16(minT);
+		int lightWidth = CeilDiv16(maxS) - lightMinS + 1;
+		int lightHeight = CeilDiv16(maxT) - lightMinT + 1;
+
+		if (atlasX + lightWidth > world->lightmapAtlasWidth) {
+			atlasX = 0;
+			atlasY += atlasRowHeight;
+			atlasRowHeight = 0;
+		}
+
+		world->lightmaps[i].x = atlasX;
+		world->lightmaps[i].y = atlasY;
+		world->lightmaps[i].width = lightWidth;
+		world->lightmaps[i].height = lightHeight;
+		world->lightmaps[i].minS = lightMinS;
+		world->lightmaps[i].minT = lightMinT;
+
+		atlasX += lightWidth;
+		if (lightHeight > atlasRowHeight) {
+			atlasRowHeight = lightHeight;
+		}
+	}
+
+	world->lightmapAtlasHeight = atlasY + atlasRowHeight;
+	if (world->lightmapAtlasHeight < 1) {
+		world->lightmapAtlasHeight = 1;
+	}
+
+	unsigned int *atlas = new unsigned int [world->lightmapAtlasWidth * world->lightmapAtlasHeight];
+	for (int i = 0; i < world->lightmapAtlasWidth * world->lightmapAtlasHeight; i++) {
+		atlas[i] = 0xFFFFFFFF;
+	}
+
+	for (int i = 0; i < numSurfaces; i++) {
+		BuildLightmap(world, i, atlas);
+	}
+
+	RETROVK_UploadMeshLightmap(&mesh, 0, world->lightmapAtlasWidth, world->lightmapAtlasHeight, atlas);
+	delete[] atlas;
+
+	// Convert the stashed texture-space coords into normalized atlas coords,
+	// centred on the luxel (the +8 is half of the 16-texel luxel spacing).
+	for (int i = 0; i < numSurfaces; i++) {
+		int numEdges = world->map.getNumEdges(i);
+		LightmapRect *rect = &world->lightmaps[i];
+		primdesc_t *primitives = &world->surfacePrimitives[i * world->numMaxEdgesPerSurface];
+		for (int j = 0; j < numEdges; j++, primitives++) {
+			float luxelS = (primitives->l[0] - rect->minS * 16 + 8) / 16.0f;
+			float luxelT = (primitives->l[1] - rect->minT * 16 + 8) / 16.0f;
+			primitives->l[0] = (rect->x + luxelS) / (float)world->lightmapAtlasWidth;
+			primitives->l[1] = (rect->y + luxelT) / (float)world->lightmapAtlasHeight;
 		}
 	}
 
@@ -173,6 +302,8 @@ bool BuildMeshVertices(World *world)
 				vertices[written].pos[2] = p->v[2];
 				vertices[written].uv[0] = p->t[0];
 				vertices[written].uv[1] = p->t[1];
+				vertices[written].lightUv[0] = p->l[0];
+				vertices[written].lightUv[1] = p->l[1];
 				written++;
 			}
 		}
@@ -209,7 +340,7 @@ void DrawSurfaces(World *world, int *visibleSurfaces, int numVisibleSurfaces)
 		const SurfaceDraw *draw = &world->surfaceDraws[surface];
 		float color[3];
 		GetSurfaceColor(surface, color);
-		RETROVK_DrawMeshRange(&mesh, textureInfo->miptex, 0, draw->firstVertex, draw->vertexCount, color, 0);
+		RETROVK_DrawMeshRange(&mesh, textureInfo->miptex, surface, draw->firstVertex, draw->vertexCount, color, 0);
 	}
 }
 
@@ -324,6 +455,7 @@ void DEMO_Initialize(void)
 	if (!UploadTextures(&world)) {
 		RETRO_RageQuit("Unable to initialize world textures\n");
 	}
+	RETROVK_CreateMeshLightmaps(&mesh, world.map.getNumSurfaces(), VK_FILTER_LINEAR, VK_FILTER_LINEAR);
 	if (!BuildSurfacePrimitives(&world)) {
 		RETRO_RageQuit("Unable to initialize world surfaces\n");
 	}
@@ -331,14 +463,12 @@ void DEMO_Initialize(void)
 		RETRO_RageQuit("Unable to build vertex buffer\n");
 	}
 
-	// The textured pipeline still uses lightmap and luma descriptor sets. Provide
-	// dummy descriptors until those features are added in later commits.
+	// The textured pipeline still uses the luma descriptor set. Provide dummy
+	// descriptors until fullbright luma is added in a later commit.
 	unsigned int filler = 0xFFFFFFFF;
 	for (int i = 0; i < world.map.getNumTextures(); i++) {
 		RETROVK_UploadMeshLumaTexture(&mesh, i, 1, 1, &filler);
 	}
-	RETROVK_CreateMeshLightmaps(&mesh, 1, VK_FILTER_NEAREST, VK_FILTER_NEAREST);
-	RETROVK_UploadMeshLightmap(&mesh, 0, 1, 1, &filler);
 	RETROVK_CreateMeshPipelines(&mesh, quake_vert_spv, sizeof(quake_vert_spv), quake_frag_spv, sizeof(quake_frag_spv));
 
 	// Set the camera's starting position
@@ -356,6 +486,7 @@ void DEMO_Deinitialize(void)
 	if (world.surfaceDraws) delete[] world.surfaceDraws;
 	if (world.surfacePrimitives) delete[] world.surfacePrimitives;
 	if (world.visibleSurfaces) delete[] world.visibleSurfaces;
+	if (world.lightmaps) delete[] world.lightmaps;
 	RETRO_FreeBSP(&world.map);
 }
 
