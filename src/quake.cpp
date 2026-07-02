@@ -44,6 +44,9 @@ struct World
 	LightmapRect *lightmaps = NULL;			// Per-surface rectangle inside the lightmap atlas
 	int lightmapAtlasWidth = 0;
 	int lightmapAtlasHeight = 0;
+	int lightStyleFrame = -1;				// Current frame index of the 10Hz light animations
+	int lightStyles[64];					// Current values of the 64 light styles
+	double lightStyleTime = 0.0;			// Time accumulator for light styles
 };
 
 World world;
@@ -100,6 +103,67 @@ bool UploadTextures(World *world)
 }
 
 //
+// Classic Quake light-style brightness patterns. Each character 'a'..'z' is a
+// brightness level ('a' = dark, 'm' = normal, 'z' = bright), cycled at 10 Hz.
+//
+const char *LightStylePattern(int style)
+{
+	static const char *patterns[] = {
+		"m",
+		"mmnmmommommnonmmonqnmmo",
+		"abcdefghijklmnopqrstuvwxyzyxwvutsrqponmlkjihgfedcba",
+		"mmmmmaaaaammmmmaaaaaabcdefgabcdefg",
+		"mamamamamama",
+		"jklmnopqrstuvwxyzyxwvutsrqponmlkj",
+		"nmonqnmomnmomomno",
+		"mmmaaaabcdefgmmmmaaaammmaamm",
+		"mmmaaammmaaammmabcdefaaaammmmabcdefmmmaaaa",
+		"aaaaaaaazzzzzzzz",
+		"mmamammmmammamamaaamammma",
+		"abcdefghijklmnopqrrqponmlkjihgfedcba",
+		"mmnnmmnnnmmnn",
+		"kmjmlnklkj",
+		"mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmaaaaaaaazzzzzzzz",
+	};
+
+	if (style >= 0 && style < (int)(sizeof(patterns) / sizeof(patterns[0]))) {
+		return patterns[style];
+	}
+	return "m";
+}
+
+//
+// Advance classic Quake animated light style values. Returns true when the
+// 10Hz style frame changed and dynamic lightmaps should be refreshed.
+//
+bool UpdateLightStyles(World *world, double deltaTime)
+{
+	world->lightStyleTime += deltaTime;
+	int frame = (int)(world->lightStyleTime * 10.0);	// light styles animate at 10 Hz
+	if (frame == world->lightStyleFrame) {
+		return false;
+	}
+	world->lightStyleFrame = frame;
+
+	for (int style = 0; style < 64; style++) {
+		const char *pattern = LightStylePattern(style);
+		int length = 0;
+		while (pattern[length]) {
+			length++;
+		}
+
+		// Map the current pattern letter 'a'..'z' onto a brightness scale where
+		// 'm' (== 264) is normal full-strength lighting.
+		char value = pattern[length > 0 ? frame % length : 0];
+		if (value < 'a') value = 'a';
+		if (value > 'z') value = 'z';
+		world->lightStyles[style] = ((int)value - (int)'a') * 22;
+	}
+
+	return true;
+}
+
+//
 // Fill the atlas rectangle for one surface. Sky and liquid surfaces
 // (TEX_SPECIAL), and faces with no stored lighting, get solid white luxels so
 // the modulate pass leaves the base texture at full brightness.
@@ -126,14 +190,39 @@ void BuildLightmap(World *world, int surface, unsigned int *atlas)
 	for (int y = 0; y < rect->height; y++) {
 		for (int x = 0; x < rect->width; x++) {
 			int src = x + y * rect->width;
-			int intensity = 0;
+			float intensity = 0.0f;
 			for (int style = 0; style < MAXLIGHTMAPS && face->styles[style] != 255; style++) {
-				intensity += samples[style * size + src];
+				int styleIndex = face->styles[style];
+				float scale = 1.0f;
+				if (styleIndex < 64) {
+					scale = (float)world->lightStyles[styleIndex] / 264.0f;
+				}
+				intensity += (float)samples[style * size + src] * scale;
 			}
-			unsigned int light = (intensity > 255) ? 255 : (unsigned int)intensity;
+			int intVal = (int)(intensity + 0.5f);
+			unsigned int light = (intVal > 255) ? 255 : (unsigned int)intVal;
 			atlas[(rect->x + x) + (rect->y + y) * world->lightmapAtlasWidth] = 0xFF000000 | (light << 16) | (light << 8) | light;
 		}
 	}
+}
+
+void FillLightmapAtlas(World *world, unsigned int *atlas)
+{
+	for (int i = 0; i < world->lightmapAtlasWidth * world->lightmapAtlasHeight; i++) {
+		atlas[i] = 0xFFFFFFFF;
+	}
+
+	for (int i = 0; i < world->map.getNumSurfaces(); i++) {
+		BuildLightmap(world, i, atlas);
+	}
+}
+
+void UpdateLightmapAtlas(World *world)
+{
+	unsigned int *atlas = new unsigned int [world->lightmapAtlasWidth * world->lightmapAtlasHeight];
+	FillLightmapAtlas(world, atlas);
+	RETROVK_UpdateMeshLightmap(&mesh, world->lightmapAtlasWidth, world->lightmapAtlasHeight, atlas);
+	delete[] atlas;
 }
 
 //
@@ -242,14 +331,7 @@ bool BuildSurfacePrimitives(World *world)
 	}
 
 	unsigned int *atlas = new unsigned int [world->lightmapAtlasWidth * world->lightmapAtlasHeight];
-	for (int i = 0; i < world->lightmapAtlasWidth * world->lightmapAtlasHeight; i++) {
-		atlas[i] = 0xFFFFFFFF;
-	}
-
-	for (int i = 0; i < numSurfaces; i++) {
-		BuildLightmap(world, i, atlas);
-	}
-
+	FillLightmapAtlas(world, atlas);
 	RETROVK_UploadMeshLightmap(&mesh, 0, world->lightmapAtlasWidth, world->lightmapAtlasHeight, atlas);
 	delete[] atlas;
 
@@ -462,6 +544,7 @@ void DEMO_Initialize(void)
 	if (!UploadTextures(&world)) {
 		RETRO_RageQuit("Unable to initialize world textures\n");
 	}
+	UpdateLightStyles(&world, 0.0);
 	RETROVK_CreateMeshLightmaps(&mesh, world.map.getNumSurfaces(), VK_FILTER_LINEAR, VK_FILTER_LINEAR);
 	if (!BuildSurfacePrimitives(&world)) {
 		RETRO_RageQuit("Unable to initialize world surfaces\n");
@@ -554,7 +637,9 @@ void DEMO_Input(double deltatime)
 
 void DEMO_Render(double deltatime)
 {
-	(void)deltatime;
+	if (UpdateLightStyles(&world, deltatime)) {
+		UpdateLightmapAtlas(&world);
+	}
 
 	// Build the model-view-projection matrix (Vulkan equivalent of gluPerspective/gluLookAt)
 	float aspect = (float)RETROVK.swapchainExtent.width / (float)RETROVK.swapchainExtent.height;
