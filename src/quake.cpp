@@ -12,8 +12,14 @@
 #include "quake_vert_spv.h"
 #include "quake_frag_spv.h"
 #include <float.h>
+#include <math.h>
 
 #define MOVEMENT_SPEED 5.0
+#define SURFACE_FLAG_TURBULENT 1
+#define SURFACE_FLAG_SKY 2
+#define SKY_DOME_SLICES 64
+#define SKY_DOME_STACKS 32
+#define SKY_DOME_RADIUS 4096.0f
 
 // Where a surface's triangles live in the mesh vertex buffer. One entry
 // per BSP surface.
@@ -47,7 +53,11 @@ struct World
 	int *visibleSurfaces = NULL;			// Array of visible surfaces, contains an index to the surfaces
 	int numMaxEdgesPerSurface = 0;			// Max edges per surface
 	SurfaceDraw *surfaceDraws = NULL;		// Per-surface slice into the mesh vertex buffer
+	SurfaceDraw skyDomeDraw;				// Slice containing the continuous sky dome
 	TextureAnim *textureAnimations = NULL;	// Per-texture animation sequence table
+	bool *textureSky = NULL;				// Per-texture sky classification
+	bool *textureTurbulent = NULL;			// Per-texture liquid classification
+	int skyTextureIndex = -1;				// Texture used by the sky dome
 	int numTextures = 0;
 	double textureTime = 0.0;				// Time accumulator for animated texture sequences
 	LightmapRect *lightmaps = NULL;			// Per-surface rectangle inside the lightmap atlas
@@ -63,6 +73,25 @@ RETROVK_Mesh mesh;				// Textured mesh resources, owned and driven through retro
 RETROVK_RenderMode renderMode = RETROVK_RENDER_TEXTURED;	// Selected with keys 1-4
 RETRO_Camera camera;
 
+bool IsSkyTextureName(const char *name)
+{
+	if (!name) {
+		return false;
+	}
+	char c0 = name[0];
+	char c1 = name[1];
+	char c2 = name[2];
+	if (c0 >= 'A' && c0 <= 'Z') c0 += 'a' - 'A';
+	if (c1 >= 'A' && c1 <= 'Z') c1 += 'a' - 'A';
+	if (c2 >= 'A' && c2 <= 'Z') c2 += 'a' - 'A';
+	return c0 == 's' && c1 == 'k' && c2 == 'y';
+}
+
+bool IsTurbulentTextureName(const char *name)
+{
+	return name && name[0] == '*';
+}
+
 //
 // Expand the palettised mip textures into RGBA images and upload them to the
 // mesh, one slot per BSP texture.
@@ -70,6 +99,8 @@ RETRO_Camera camera;
 bool UploadTextures(World *world)
 {
 	world->numTextures = world->map.getNumTextures();
+	world->textureSky = new bool [world->numTextures];
+	world->textureTurbulent = new bool [world->numTextures];
 
 	// NEAREST magnification (chunky texels, matching the old GL_NEAREST) and
 	// trilinear minification across mip levels.
@@ -78,6 +109,9 @@ bool UploadTextures(World *world)
 	// Build an RGBA image for every texture slot. Missing slots get a 1x1 filler
 	// so that every surface has a valid texture to bind.
 	for (int i = 0; i < world->numTextures; i++) {
+		world->textureSky[i] = false;
+		world->textureTurbulent[i] = false;
+
 		miptex_t *mipTexture = world->map.getMipTexture(i);
 		if (!mipTexture || !mipTexture->name[0] || mipTexture->offsets[0] == 0) {
 			unsigned int filler = 0xFF000000;	// Opaque black
@@ -89,6 +123,11 @@ bool UploadTextures(World *world)
 
 		int width = mipTexture->width;
 		int height = mipTexture->height;
+		world->textureSky[i] = IsSkyTextureName(mipTexture->name);
+		world->textureTurbulent[i] = IsTurbulentTextureName(mipTexture->name);
+		if (world->textureSky[i] && world->skyTextureIndex < 0) {
+			world->skyTextureIndex = i;
+		}
 
 		// Expand the 8-bit indexed full-resolution mip into RGBA (force opaque alpha)
 		unsigned int *texture = new unsigned int[width * height];
@@ -97,7 +136,11 @@ bool UploadTextures(World *world)
 		for (int y = 0; y < height; y++) {
 			for (int x = 0; x < width; x++) {
 				unsigned char colorIndex = rawTexture[x + y * width];
-				texture[x + y * width] = world->map.palette[colorIndex] | 0xFF000000;
+				unsigned int alpha = 0xFF000000;
+				if (world->textureSky[i] && x < width / 2 && colorIndex == 0) {
+					alpha = 0x00000000;
+				}
+				texture[x + y * width] = world->map.palette[colorIndex] | alpha;
 				lumaTexture[x + y * width] = (colorIndex >= 224) ? (world->map.palette[colorIndex] | 0xFF000000) : 0x00000000;
 			}
 		}
@@ -448,6 +491,8 @@ bool BuildMeshVertices(World *world)
 {
 	int numSurfaces = world->map.getNumSurfaces();
 	world->surfaceDraws = new SurfaceDraw[numSurfaces];
+	world->skyDomeDraw.firstVertex = 0;
+	world->skyDomeDraw.vertexCount = 0;
 
 	// Count the triangulated vertices: an N-edge fan yields (N-2) triangles
 	int totalVertices = 0;
@@ -457,6 +502,8 @@ bool BuildMeshVertices(World *world)
 			totalVertices += (numEdges - 2) * 3;
 		}
 	}
+	int skyDomeVertices = SKY_DOME_SLICES * SKY_DOME_STACKS * 6;
+	totalVertices += skyDomeVertices;
 
 	RETROVK_Vertex *vertices = new RETROVK_Vertex[totalVertices];
 	int written = 0;
@@ -481,6 +528,36 @@ bool BuildMeshVertices(World *world)
 				vertices[written].uv[1] = p->t[1];
 				vertices[written].lightUv[0] = p->l[0];
 				vertices[written].lightUv[1] = p->l[1];
+				written++;
+			}
+		}
+	}
+
+	world->skyDomeDraw.firstVertex = written;
+	world->skyDomeDraw.vertexCount = skyDomeVertices;
+
+	for (int stack = 0; stack < SKY_DOME_STACKS; stack++) {
+		float phi0 = (-0.5f + (float)stack / (float)SKY_DOME_STACKS) * 3.14159265358979323846f;
+		float phi1 = (-0.5f + (float)(stack + 1) / (float)SKY_DOME_STACKS) * 3.14159265358979323846f;
+		for (int slice = 0; slice < SKY_DOME_SLICES; slice++) {
+			float theta0 = ((float)slice / (float)SKY_DOME_SLICES) * 2.0f * 3.14159265358979323846f;
+			float theta1 = ((float)(slice + 1) / (float)SKY_DOME_SLICES) * 2.0f * 3.14159265358979323846f;
+			float dirs[4][3] = {
+				{ cosf(phi0) * cosf(theta0), cosf(phi0) * sinf(theta0), sinf(phi0) },
+				{ cosf(phi1) * cosf(theta0), cosf(phi1) * sinf(theta0), sinf(phi1) },
+				{ cosf(phi1) * cosf(theta1), cosf(phi1) * sinf(theta1), sinf(phi1) },
+				{ cosf(phi0) * cosf(theta1), cosf(phi0) * sinf(theta1), sinf(phi0) },
+			};
+			const int indices[6] = { 0, 1, 2, 0, 2, 3 };
+			for (int i = 0; i < 6; i++) {
+				float *dir = dirs[indices[i]];
+				vertices[written].pos[0] = dir[0] * SKY_DOME_RADIUS;
+				vertices[written].pos[1] = dir[1] * SKY_DOME_RADIUS;
+				vertices[written].pos[2] = dir[2] * SKY_DOME_RADIUS;
+				vertices[written].uv[0] = 0.0f;
+				vertices[written].uv[1] = 0.0f;
+				vertices[written].lightUv[0] = 0.0f;
+				vertices[written].lightUv[1] = 0.0f;
 				written++;
 			}
 		}
@@ -515,11 +592,29 @@ void DrawSurfaces(World *world, int *visibleSurfaces, int numVisibleSurfaces)
 		// The texture this surface uses, and where its triangles live in the mesh
 		texinfo_t *textureInfo = world->map.getTextureInfo(surface);
 		int textureIndex = ResolveTextureAnimation(world, textureInfo->miptex);
+		int surfaceFlags = 0;
+		if (textureIndex >= 0 && textureIndex < world->numTextures) {
+			if (world->textureTurbulent[textureIndex]) surfaceFlags |= SURFACE_FLAG_TURBULENT;
+			if (world->textureSky[textureIndex]) surfaceFlags |= SURFACE_FLAG_SKY;
+		}
+		if (renderMode == RETROVK_RENDER_TEXTURED && (surfaceFlags & SURFACE_FLAG_SKY)) {
+			continue;
+		}
 		const SurfaceDraw *draw = &world->surfaceDraws[surface];
 		float color[3];
 		GetSurfaceColor(surface, color);
-		RETROVK_DrawMeshRange(&mesh, textureIndex, surface, draw->firstVertex, draw->vertexCount, color, 0);
+		RETROVK_DrawMeshRange(&mesh, textureIndex, surface, draw->firstVertex, draw->vertexCount, color, surfaceFlags);
 	}
+}
+
+void DrawSkyDome(World *world)
+{
+	if (renderMode != RETROVK_RENDER_TEXTURED || world->skyTextureIndex < 0 || world->skyDomeDraw.vertexCount == 0) {
+		return;
+	}
+
+	float color[3] = { 1.0f, 1.0f, 1.0f };
+	RETROVK_DrawMeshRange(&mesh, world->skyTextureIndex, 0, world->skyDomeDraw.firstVertex, world->skyDomeDraw.vertexCount, color, SURFACE_FLAG_SKY);
 }
 
 //
@@ -664,6 +759,8 @@ void DEMO_Deinitialize(void)
 	if (world.visibleSurfaces) delete[] world.visibleSurfaces;
 	if (world.lightmaps) delete[] world.lightmaps;
 	if (world.textureAnimations) delete[] world.textureAnimations;
+	if (world.textureSky) delete[] world.textureSky;
+	if (world.textureTurbulent) delete[] world.textureTurbulent;
 	RETRO_FreeBSP(&world.map);
 }
 
@@ -752,6 +849,7 @@ void DEMO_Render(double deltatime)
 	dleaf_t *leaf = FindCameraLeaf(&world, &camera);
 
 	// Render visible BSP surfaces.
-	RETROVK_PrepareMeshDraws(&mesh, mvp, renderMode, 0.0f, camera.origin);
+	RETROVK_PrepareMeshDraws(&mesh, mvp, renderMode, (float)world.textureTime, camera.origin);
+	DrawSkyDome(&world);
 	DrawVisibleSet(&world, leaf);
 }
