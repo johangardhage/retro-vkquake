@@ -33,6 +33,12 @@ struct LightmapRect
 	int minT;
 };
 
+struct TextureAnim
+{
+	int total = 0;
+	int frames[10];
+};
+
 struct World
 {
 	RETRO_BSP map;							// The loaded map (BSP, palette and colormap), owned by value
@@ -41,6 +47,9 @@ struct World
 	int *visibleSurfaces = NULL;			// Array of visible surfaces, contains an index to the surfaces
 	int numMaxEdgesPerSurface = 0;			// Max edges per surface
 	SurfaceDraw *surfaceDraws = NULL;		// Per-surface slice into the mesh vertex buffer
+	TextureAnim *textureAnimations = NULL;	// Per-texture animation sequence table
+	int numTextures = 0;
+	double textureTime = 0.0;				// Time accumulator for animated texture sequences
 	LightmapRect *lightmaps = NULL;			// Per-surface rectangle inside the lightmap atlas
 	int lightmapAtlasWidth = 0;
 	int lightmapAtlasHeight = 0;
@@ -60,15 +69,15 @@ RETRO_Camera camera;
 //
 bool UploadTextures(World *world)
 {
-	int numTextures = world->map.getNumTextures();
+	world->numTextures = world->map.getNumTextures();
 
 	// NEAREST magnification (chunky texels, matching the old GL_NEAREST) and
 	// trilinear minification across mip levels.
-	RETROVK_CreateMeshTextures(&mesh, numTextures, VK_FILTER_NEAREST, VK_FILTER_LINEAR);
+	RETROVK_CreateMeshTextures(&mesh, world->numTextures, VK_FILTER_NEAREST, VK_FILTER_LINEAR);
 
 	// Build an RGBA image for every texture slot. Missing slots get a 1x1 filler
 	// so that every surface has a valid texture to bind.
-	for (int i = 0; i < numTextures; i++) {
+	for (int i = 0; i < world->numTextures; i++) {
 		miptex_t *mipTexture = world->map.getMipTexture(i);
 		if (!mipTexture || !mipTexture->name[0] || mipTexture->offsets[0] == 0) {
 			unsigned int filler = 0xFF000000;	// Opaque black
@@ -100,6 +109,85 @@ bool UploadTextures(World *world)
 	}
 
 	return true;
+}
+
+int TextureAnimationFrame(const char *name)
+{
+	if (!name || name[0] != '+') return -1;
+	if (name[1] >= '0' && name[1] <= '9') return name[1] - '0';
+	return -1;
+}
+
+bool IsSameTextureAnimation(const char *a, const char *b)
+{
+	if (!a || !b || a[0] != '+' || b[0] != '+') {
+		return false;
+	}
+
+	for (int i = 2; i < 16; i++) {
+		if (a[i] != b[i]) return false;
+		if (a[i] == '\0') return true;
+	}
+
+	return true;
+}
+
+bool BuildTextureAnimations(World *world)
+{
+	world->textureAnimations = new TextureAnim[world->numTextures];
+	for (int i = 0; i < world->numTextures; i++) {
+		world->textureAnimations[i].total = 0;
+		for (int frame = 0; frame < 10; frame++) {
+			world->textureAnimations[i].frames[frame] = -1;
+		}
+	}
+
+	for (int i = 0; i < world->numTextures; i++) {
+		miptex_t *baseTexture = world->map.getMipTexture(i);
+		if (!baseTexture || TextureAnimationFrame(baseTexture->name) != 0) {
+			continue;
+		}
+
+		TextureAnim *anim = &world->textureAnimations[i];
+		for (int j = 0; j < world->numTextures; j++) {
+			miptex_t *frameTexture = world->map.getMipTexture(j);
+			if (!frameTexture || !IsSameTextureAnimation(baseTexture->name, frameTexture->name)) {
+				continue;
+			}
+
+			int frame = TextureAnimationFrame(frameTexture->name);
+			if (frame >= 0 && frame < 10) {
+				anim->frames[frame] = j;
+				if (anim->total < frame + 1) {
+					anim->total = frame + 1;
+				}
+			}
+		}
+	}
+
+	return true;
+}
+
+int ResolveTextureAnimation(World *world, int textureIndex)
+{
+	if (textureIndex < 0 || textureIndex >= world->numTextures || !world->textureAnimations) {
+		return textureIndex;
+	}
+
+	TextureAnim *anim = &world->textureAnimations[textureIndex];
+	if (anim->total <= 1) {
+		return textureIndex;
+	}
+
+	int frame = ((int)(world->textureTime * 10.0)) % anim->total;
+	int resolved = anim->frames[frame];
+	if (resolved < 0) {
+		resolved = anim->frames[0];
+	}
+	if (resolved < 0 || resolved >= world->numTextures) {
+		return textureIndex;
+	}
+	return resolved;
 }
 
 //
@@ -426,10 +514,11 @@ void DrawSurfaces(World *world, int *visibleSurfaces, int numVisibleSurfaces)
 		int surface = visibleSurfaces[i];
 		// The texture this surface uses, and where its triangles live in the mesh
 		texinfo_t *textureInfo = world->map.getTextureInfo(surface);
+		int textureIndex = ResolveTextureAnimation(world, textureInfo->miptex);
 		const SurfaceDraw *draw = &world->surfaceDraws[surface];
 		float color[3];
 		GetSurfaceColor(surface, color);
-		RETROVK_DrawMeshRange(&mesh, textureInfo->miptex, surface, draw->firstVertex, draw->vertexCount, color, 0);
+		RETROVK_DrawMeshRange(&mesh, textureIndex, surface, draw->firstVertex, draw->vertexCount, color, 0);
 	}
 }
 
@@ -544,6 +633,9 @@ void DEMO_Initialize(void)
 	if (!UploadTextures(&world)) {
 		RETRO_RageQuit("Unable to initialize world textures\n");
 	}
+	if (!BuildTextureAnimations(&world)) {
+		RETRO_RageQuit("Unable to initialize texture animations\n");
+	}
 	UpdateLightStyles(&world, 0.0);
 	RETROVK_CreateMeshLightmaps(&mesh, world.map.getNumSurfaces(), VK_FILTER_LINEAR, VK_FILTER_LINEAR);
 	if (!BuildSurfacePrimitives(&world)) {
@@ -571,6 +663,7 @@ void DEMO_Deinitialize(void)
 	if (world.surfacePrimitives) delete[] world.surfacePrimitives;
 	if (world.visibleSurfaces) delete[] world.visibleSurfaces;
 	if (world.lightmaps) delete[] world.lightmaps;
+	if (world.textureAnimations) delete[] world.textureAnimations;
 	RETRO_FreeBSP(&world.map);
 }
 
@@ -637,6 +730,8 @@ void DEMO_Input(double deltatime)
 
 void DEMO_Render(double deltatime)
 {
+	world.textureTime += deltatime;
+
 	if (UpdateLightStyles(&world, deltatime)) {
 		UpdateLightmapAtlas(&world);
 	}
