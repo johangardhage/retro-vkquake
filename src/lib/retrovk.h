@@ -35,6 +35,7 @@ struct {
 	VkDevice device = VK_NULL_HANDLE;
 	uint32_t queueFamily = 0;
 	VkQueue graphicsQueue = VK_NULL_HANDLE;	// Also used for presentation (single family)
+	bool wireframeSupported = false;	// fillModeNonSolid (VK_POLYGON_MODE_LINE); absent on KosmicKrisp
 
 	VkSwapchainKHR swapchain = VK_NULL_HANDLE;
 	VkFormat swapchainFormat;
@@ -1084,9 +1085,12 @@ void RETROVK_CreateMeshPipelines(RETROVK_Mesh *mesh, const uint32_t *vertSpv, si
 	config.polygonMode = VK_POLYGON_MODE_FILL;
 	mesh->pipelineFill = RETROVK_CreateGraphicsPipeline(&config);
 
-	config.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-	config.polygonMode = VK_POLYGON_MODE_LINE;
-	mesh->pipelineWireframe = RETROVK_CreateGraphicsPipeline(&config);
+	// Without fillModeNonSolid there is no line polygon mode; wireframe falls back to fill
+	if (RETROVK.wireframeSupported) {
+		config.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+		config.polygonMode = VK_POLYGON_MODE_LINE;
+		mesh->pipelineWireframe = RETROVK_CreateGraphicsPipeline(&config);
+	}
 
 	config.topology = VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
 	config.polygonMode = VK_POLYGON_MODE_FILL;
@@ -1101,7 +1105,7 @@ void RETROVK_CreateMeshPipelines(RETROVK_Mesh *mesh, const uint32_t *vertSpv, si
 void RETROVK_PrepareMeshDraws(RETROVK_Mesh *mesh, const float *mvp, RETROVK_RenderMode mode, float time, const float *cameraOrigin)
 {
 	VkPipeline selected = mesh->pipelineFill;
-	if (mode == RETROVK_RENDER_WIREFRAME) {
+	if (mode == RETROVK_RENDER_WIREFRAME && mesh->pipelineWireframe != VK_NULL_HANDLE) {
 		selected = mesh->pipelineWireframe;
 	} else if (mode == RETROVK_RENDER_POINTS) {
 		selected = mesh->pipelinePoints;
@@ -1251,37 +1255,58 @@ static bool RETROVK_PickPhysicalDevice(bool *needsPortabilitySubset)
 	VkPhysicalDevice *devices = new VkPhysicalDevice[deviceCount];
 	vkEnumeratePhysicalDevices(RETROVK.instance, &deviceCount, devices);
 
-	bool found = false;
-	for (uint32_t d = 0; d < deviceCount && !found; d++) {
+	// Score every usable device and keep the best: a hardware GPU beats a CPU
+	// rasterizer (lavapipe), and a fully conformant driver beats one that needs
+	// the portability subset. On Apple silicon that ranks KosmicKrisp first,
+	// then MoltenVK, then lavapipe. VK_DRIVER_FILES still forces one driver.
+	int bestScore = -1;
+	for (uint32_t d = 0; d < deviceCount; d++) {
 		uint32_t familyCount = 0;
 		vkGetPhysicalDeviceQueueFamilyProperties(devices[d], &familyCount, NULL);
 		VkQueueFamilyProperties *families = new VkQueueFamilyProperties[familyCount];
 		vkGetPhysicalDeviceQueueFamilyProperties(devices[d], &familyCount, families);
 
+		int family = -1;
 		for (uint32_t f = 0; f < familyCount; f++) {
 			VkBool32 presentSupport = VK_FALSE;
 			vkGetPhysicalDeviceSurfaceSupportKHR(devices[d], f, RETROVK.surface, &presentSupport);
 			if ((families[f].queueFlags & VK_QUEUE_GRAPHICS_BIT) && presentSupport) {
-				RETROVK.physicalDevice = devices[d];
-				RETROVK.queueFamily = f;
-				found = true;
+				family = (int)f;
 				break;
 			}
 		}
 		delete[] families;
+		if (family < 0) {
+			continue;
+		}
 
-		if (found) {
-			uint32_t extCount = 0;
-			vkEnumerateDeviceExtensionProperties(RETROVK.physicalDevice, NULL, &extCount, NULL);
-			VkExtensionProperties *exts = new VkExtensionProperties[extCount];
-			vkEnumerateDeviceExtensionProperties(RETROVK.physicalDevice, NULL, &extCount, exts);
-			*needsPortabilitySubset = RETROVK_HasExtension(exts, extCount, "VK_KHR_portability_subset");
-			delete[] exts;
+		uint32_t extCount = 0;
+		vkEnumerateDeviceExtensionProperties(devices[d], NULL, &extCount, NULL);
+		VkExtensionProperties *exts = new VkExtensionProperties[extCount];
+		vkEnumerateDeviceExtensionProperties(devices[d], NULL, &extCount, exts);
+		bool portability = RETROVK_HasExtension(exts, extCount, "VK_KHR_portability_subset");
+		delete[] exts;
+
+		VkPhysicalDeviceProperties props;
+		vkGetPhysicalDeviceProperties(devices[d], &props);
+		int score = 0;
+		if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU || props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) {
+			score += 2;
+		}
+		if (!portability) {
+			score += 1;
+		}
+
+		if (score > bestScore) {
+			bestScore = score;
+			RETROVK.physicalDevice = devices[d];
+			RETROVK.queueFamily = (uint32_t)family;
+			*needsPortabilitySubset = portability;
 		}
 	}
 
 	delete[] devices;
-	return found;
+	return bestScore >= 0;
 }
 
 static void RETROVK_CreateDevice(bool needsPortabilitySubset)
@@ -1300,8 +1325,17 @@ static void RETROVK_CreateDevice(bool needsPortabilitySubset)
 		deviceExtensions[deviceExtCount++] = "VK_KHR_portability_subset";
 	}
 
+	VkPhysicalDeviceProperties props;
+	vkGetPhysicalDeviceProperties(RETROVK.physicalDevice, &props);
+	VkPhysicalDeviceFeatures supported;
+	vkGetPhysicalDeviceFeatures(RETROVK.physicalDevice, &supported);
+	RETROVK.wireframeSupported = supported.fillModeNonSolid == VK_TRUE;
+	printf("Vulkan device: %s (API %u.%u.%u)%s\n", props.deviceName,
+		VK_API_VERSION_MAJOR(props.apiVersion), VK_API_VERSION_MINOR(props.apiVersion), VK_API_VERSION_PATCH(props.apiVersion),
+		RETROVK.wireframeSupported ? "" : ", no fillModeNonSolid: wireframe drawn filled");
+
 	VkPhysicalDeviceFeatures features = {};
-	features.fillModeNonSolid = VK_TRUE;	// Needed for wireframe render mode (VK_POLYGON_MODE_LINE)
+	features.fillModeNonSolid = supported.fillModeNonSolid;	// Wireframe render mode (VK_POLYGON_MODE_LINE), when available
 	features.samplerAnisotropy = VK_FALSE;
 
 	VkDeviceCreateInfo createInfo = {};
